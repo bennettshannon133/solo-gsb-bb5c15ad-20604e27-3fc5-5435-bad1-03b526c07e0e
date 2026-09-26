@@ -22,6 +22,9 @@
 - 支持**成绩发布**：在同一 SQLite 事务内读取当前打卡、按现有分段规则为所有有记录选手
   （含未完赛、保留 `pending` 分段者）生成**单调递增、不可变的版本快照**并整版原子保存；
 - 已发布版本按版本号 / 最新版查询；后续打卡、更正或撤销只影响实时成绩，**不改已发布版本**；
+- 提供**接力队成绩核算**：提交已发布版本号与按赛段顺序排列的选手号（每人承担一棒、人数等于
+  站点数减一且不得重复），从该版本快照读取各人的对应分段与两端入选打卡，逐棒拼合并核算交接等待，
+  **不读取实时成绩**；
 - 提供选手分段结果查询。
 
 ## 启动
@@ -63,6 +66,7 @@ Compose 通过命名卷 `timing-data` 持久化数据；删除卷（`docker comp
 | `POST` | `/api/publications` | 发布成绩版本：同一事务读取当前打卡、整版快照原子保存，返回新版本完整成绩 |
 | `GET` | `/api/publications/{version}` | 按版本号查询该版本完整成绩（不存在返回 404） |
 | `GET` | `/api/publications/latest` | 查询最新发布版本完整成绩（尚未发布时返回 404） |
+| `POST` | `/api/publications/{version}/relay` | 接力队成绩核算：按赛段顺序提交选手号，基于版本快照逐棒拼合并核算交接等待（不读取实时成绩） |
 
 ### 示例
 
@@ -411,6 +415,107 @@ curl http://localhost:8000/api/publications/1         # 仍是发布时的 v1 �
 curl http://localhost:8000/api/publications/latest    # -> version 2
 ```
 
+## 接力队成绩核算
+
+提交**已发布成绩版本号**与**按赛段顺序排列的选手号**：第 `i` 名选手仅承担赛段 `i→i+1`。
+人数须等于该版本**站点数减一**（6 站即 5 人）且选手号**不得重复**。核算所需的各棒用时与
+两端入选打卡全部从**该版本快照**读取，**不读取实时成绩**——发布之后的补传 / 更正 / 撤销
+不会影响核算结果。
+
+以一批接力选手（每人只在承担赛段的两端打卡）为例，先批量登记并发布（得到版本 2）：
+
+```bash
+curl -X POST http://localhost:8000/api/checkins/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "checkins": [
+      {"event_no":"T-A1-1","runner_id":"A1","station_seq":1,"occurred_at":"2026-09-25T08:00:00"},
+      {"event_no":"T-A1-2","runner_id":"A1","station_seq":2,"occurred_at":"2026-09-25T08:30:00"},
+      {"event_no":"T-A2-2","runner_id":"A2","station_seq":2,"occurred_at":"2026-09-25T08:35:00"},
+      {"event_no":"T-A2-3","runner_id":"A2","station_seq":3,"occurred_at":"2026-09-25T09:05:00"},
+      {"event_no":"T-A3-3","runner_id":"A3","station_seq":3,"occurred_at":"2026-09-25T09:05:00"},
+      {"event_no":"T-A3-4","runner_id":"A3","station_seq":4,"occurred_at":"2026-09-25T09:50:00"},
+      {"event_no":"T-A4-4","runner_id":"A4","station_seq":4,"occurred_at":"2026-09-25T10:00:00"},
+      {"event_no":"T-A4-5","runner_id":"A5","station_seq":5,"occurred_at":"2026-09-25T10:30:00"},
+      {"event_no":"T-A4-5X","runner_id":"A4","station_seq":5,"occurred_at":"2026-09-25T10:30:00"},
+      {"event_no":"T-A5-5","runner_id":"A5","station_seq":5,"occurred_at":"2026-09-25T10:30:00"},
+      {"event_no":"T-A5-6","runner_id":"A5","station_seq":6,"occurred_at":"2026-09-25T11:20:00"}
+    ]
+  }'
+curl -X POST http://localhost:8000/api/publications   # 种子数据为 v1，本版为 version 2
+```
+
+提交接力队（注意第 4 棒选手号是 `A4`，第 5 棒是 `A5`）：
+
+```bash
+curl -X POST http://localhost:8000/api/publications/2/relay \
+  -H 'Content-Type: application/json' \
+  -d '{"runner_ids": ["A1", "A2", "A3", "A4", "A5"]}'
+```
+
+响应：`legs` 为逐棒结果（选手、赛段、两端入选打卡、棒次用时），`handoffs` 为逐交接站结果
+（上一棒到达、下一棒出发、等待秒数 = 出发 - 到达）；全部有效时 `total_seconds`
+**严格等于各棒用时加全部交接等待**，即首棒起点至末棒终点：
+
+```json
+{
+  "version": 2,
+  "station_count": 6,
+  "runner_ids": ["A1", "A2", "A3", "A4", "A5"],
+  "complete": true,
+  "legs": [
+    {
+      "leg": 1, "runner_id": "A1", "from_station": 1, "to_station": 2,
+      "status": "ok", "duration_seconds": 1800, "duration": "0:30:00",
+      "start": {"station_seq": 1, "event_no": "T-A1-1", "occurred_at": "2026-09-25T08:00:00Z"},
+      "finish": {"station_seq": 2, "event_no": "T-A1-2", "occurred_at": "2026-09-25T08:30:00Z"},
+      "reason": null
+    },
+    {
+      "leg": 2, "runner_id": "A2", "from_station": 2, "to_station": 3,
+      "status": "ok", "duration_seconds": 1800, "duration": "0:30:00",
+      "start": {"station_seq": 2, "event_no": "T-A2-2", "occurred_at": "2026-09-25T08:35:00Z"},
+      "finish": {"station_seq": 3, "event_no": "T-A2-3", "occurred_at": "2026-09-25T09:05:00Z"},
+      "reason": null
+    }
+  ],
+  "handoffs": [
+    {
+      "station_seq": 2, "incoming_leg": 1, "outgoing_leg": 2, "status": "ok",
+      "wait_seconds": 300, "wait": "0:05:00",
+      "arrival": {"station_seq": 2, "event_no": "T-A1-2", "occurred_at": "2026-09-25T08:30:00Z"},
+      "departure": {"station_seq": 2, "event_no": "T-A2-2", "occurred_at": "2026-09-25T08:35:00Z"},
+      "reason": null
+    }
+  ],
+  "total_seconds": 12000,
+  "total": "3:20:00"
+}
+```
+
+规则：
+
+- 版本不存在返回 **`404`**；人数不等于站点数减一、或选手号重复返回 **`422`**；
+- 出现以下任一情况时队伍**待定**（`complete: false`、`total_seconds: null`），
+  并在 `legs` / `handoffs` 中逐棒、逐交接给出原因：
+  - 某棒选手**不在该版本内**（版本快照无其成绩）；
+  - 某棒负责的分段在版本快照中为 **`pending`**（缺站或时间倒退）；
+  - 交接站**下一棒出发早于上一棒到达**（等待为负）；该下一棒同时标记为 `pending`；
+    上一棒未到达或下一棒未出发（端点缺打卡）的交接同样待定；
+- 全部有效时总用时 = 各棒用时之和 + 各交接等待之和 = **首棒起点至末棒终点**的时间差；
+- 核算为只读操作，不写库，且只依赖 `publication_entries` 中的版本快照 JSON，
+  与实时打卡表完全隔离。
+
+种子版本 v1 上即可构造待定示例（R003 的第 5 站打卡 11:05 早于 R006 的第 5 站到达 11:10）：
+
+```bash
+curl -X POST http://localhost:8000/api/publications
+curl -X POST http://localhost:8000/api/publications/1/relay \
+  -H 'Content-Type: application/json' \
+  -d '{"runner_ids": ["R001", "R002", "R004", "R006", "R003"]}'
+# complete=false，total_seconds=null；第 5 棒与交接站 5 的原因为"下一棒出发早于上一棒到达"
+```
+
 ## 本地开发
 
 ```bash
@@ -444,4 +549,10 @@ pytest                               # 运行测试
   `INTEGER PRIMARY KEY AUTOINCREMENT` 保证版本号单调递增、不重用）与全体选手快照
   （`publication_entries`，逐选手 `SplitsOut` JSON）在同一事务内原子提交；持锁期间并发打卡 /
   更正 / 撤销一律阻塞（配合 `busy_timeout`），同一版本不会混入不同时间点的数据；
-- 已发布版本是独立于 `checkins` 实时表的快照，后续打卡 / 更正 / 撤销不会改写历史版本。
+- 已发布版本是独立于 `checkins` 实时表的快照，后续打卡 / 更正 / 撤销不会改写历史版本；
+- 接力队核算只读取指定版本的快照 JSON（`publication_entries`），不触碰 `checkins` 实时表；
+  第 `i` 名选手的棒次用时直接取其版本快照 `SplitsOut.segments[i-1]`，两端入选打卡取
+  `stations` 中对应站点；人数要求以**版本头的 `station_count`** 为准（与当前环境变量无关）。
+  各棒用时之和加各交接等待（下一棒出发减上一棒到达）天然等于首棒起点至末棒终点，代码中以
+  断言校验该恒等式；选手不在版本内、负责分段 `pending`、端点缺打卡或交接出发早于到达时
+  队伍整体待定，总用时为空并逐棒 / 逐交接给出原因。

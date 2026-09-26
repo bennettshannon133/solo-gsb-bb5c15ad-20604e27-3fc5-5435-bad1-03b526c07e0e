@@ -20,6 +20,8 @@ from .models import (
     NeutralizedOut,
     PreviewCorrectionOut,
     PublicationOut,
+    RelayTeamCreate,
+    RelayTeamOut,
     SplitsExplainOut,
     SplitsOut,
 )
@@ -39,7 +41,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="越野赛分段计时 API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "接收带唯一事件号的打卡，支持按事件号更正 / 撤销、批量登记（同一事务，"
         "任一失败整体回滚），并可预演更正（整体回滚）；"
@@ -48,7 +50,8 @@ app = FastAPI(
         "与分段结果基于同一次数据库读取；"
         "支持中立时段试算：扣除暂停计时后的净成绩，纯试算不写库；"
         "支持设备时钟校准试算：按站点校准窗偏移打卡时间后重选重算，纯试算不写库；"
-        "支持发布不可变成绩版本（同一事务整版原子快照）并按版本 / 最新版查询。"
+        "支持发布不可变成绩版本（同一事务整版原子快照）并按版本 / 最新版查询；"
+        "支持接力队成绩核算：基于已发布版本快照逐棒拼合，不读取实时成绩。"
     ),
     lifespan=lifespan,
 )
@@ -216,3 +219,16 @@ def get_publication(
     version: int, conn: sqlite3.Connection = Depends(get_db)
 ) -> PublicationOut:
     return service.get_publication(conn, version)
+
+
+@app.post(
+    "/api/publications/{version}/relay",
+    response_model=RelayTeamOut,
+    summary="接力队成绩核算：基于已发布版本快照逐棒拼合，不读取实时成绩",
+)
+def post_relay_team(
+    version: int,
+    payload: RelayTeamCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> RelayTeamOut:
+    return service.compute_relay_team(conn, version, payload)

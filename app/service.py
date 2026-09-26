@@ -28,6 +28,10 @@ from .models import (
     NeutralizedSegment,
     PreviewCorrectionOut,
     PublicationOut,
+    RelayHandoffOut,
+    RelayLegOut,
+    RelayTeamCreate,
+    RelayTeamOut,
     RunnerPreview,
     RunnerSummary,
     Segment,
@@ -835,3 +839,201 @@ def get_latest_publication(conn: sqlite3.Connection) -> PublicationOut:
     if header is None or header["version"] is None:
         raise HTTPException(status_code=404, detail="尚未发布任何成绩版本")
     return get_publication(conn, header["version"])
+
+
+# ---------- 接力队成绩核算 ----------
+
+
+def _station_map(splits: SplitsOut) -> dict[int, StationTime]:
+    """选手版本快照中的 站点序号 -> 入选打卡。"""
+    return {st.station_seq: st for st in splits.stations}
+
+
+def _relay_leg(
+    leg: int, runner_id: str, snapshot: dict[str, SplitsOut]
+) -> RelayLegOut:
+    """由版本快照构造一棒：选手不在版本内或负责分段 pending 时标记待定。"""
+    from_station, to_station = leg, leg + 1
+    splits = snapshot.get(runner_id)
+    if splits is None:
+        return RelayLegOut(
+            leg=leg,
+            runner_id=runner_id,
+            from_station=from_station,
+            to_station=to_station,
+            status="pending",
+            reason=f"选手 {runner_id} 不在成绩版本内",
+        )
+    # 分段按站点顺序存放，segments[k-1] 即赛段 k→k+1
+    segment = splits.segments[leg - 1]
+    stations = _station_map(splits)
+    start = stations.get(from_station)
+    finish = stations.get(to_station)
+    if segment.status != "ok":
+        return RelayLegOut(
+            leg=leg,
+            runner_id=runner_id,
+            from_station=from_station,
+            to_station=to_station,
+            status="pending",
+            start=start,
+            finish=finish,
+            reason=segment.reason,
+        )
+    return RelayLegOut(
+        leg=leg,
+        runner_id=runner_id,
+        from_station=from_station,
+        to_station=to_station,
+        status="ok",
+        duration_seconds=segment.duration_seconds,
+        duration=segment.duration,
+        start=start,
+        finish=finish,
+    )
+
+
+def _relay_handoff(
+    station_seq: int, incoming: RelayLegOut, outgoing: RelayLegOut
+) -> RelayHandoffOut:
+    """核算一次交接：等待 = 下一棒出发 - 上一棒到达。
+
+    返回带交接信息的 RelayHandoffOut；下一棒出发早于上一棒到达时交接待定，
+    并同步把下一棒置为 pending、清空其棒次用时（在传入的 outgoing 上原地更新）。
+    """
+    incoming_leg, outgoing_leg = incoming.leg, outgoing.leg
+    if incoming.finish is None:
+        return RelayHandoffOut(
+            station_seq=station_seq,
+            incoming_leg=incoming_leg,
+            outgoing_leg=outgoing_leg,
+            status="pending",
+            arrival=incoming.finish,
+            departure=outgoing.start,
+            reason=(
+                f"上一棒（第 {incoming_leg} 棒，{incoming.runner_id}）"
+                f"未到达站点 {station_seq}"
+            ),
+        )
+    if outgoing.start is None:
+        return RelayHandoffOut(
+            station_seq=station_seq,
+            incoming_leg=incoming_leg,
+            outgoing_leg=outgoing_leg,
+            status="pending",
+            arrival=incoming.finish,
+            departure=outgoing.start,
+            reason=(
+                f"下一棒（第 {outgoing_leg} 棒，{outgoing.runner_id}）"
+                f"未从站点 {station_seq} 出发"
+            ),
+        )
+    arrival, departure = incoming.finish.occurred_at, outgoing.start.occurred_at
+    if departure < arrival:
+        reason = (
+            f"交接站 {station_seq}：下一棒（{outgoing.runner_id}）出发时间 "
+            f"{departure.isoformat()} 早于上一棒（{incoming.runner_id}）"
+            f"到达时间 {arrival.isoformat()}"
+        )
+        # 交接非法，下一棒成绩不可用
+        outgoing.status = "pending"
+        outgoing.duration_seconds = None
+        outgoing.duration = None
+        outgoing.reason = reason
+        return RelayHandoffOut(
+            station_seq=station_seq,
+            incoming_leg=incoming_leg,
+            outgoing_leg=outgoing_leg,
+            status="pending",
+            arrival=incoming.finish,
+            departure=outgoing.start,
+            reason=reason,
+        )
+    wait = int((departure - arrival).total_seconds())
+    return RelayHandoffOut(
+        station_seq=station_seq,
+        incoming_leg=incoming_leg,
+        outgoing_leg=outgoing_leg,
+        status="ok",
+        wait_seconds=wait,
+        wait=_fmt_duration(wait),
+        arrival=incoming.finish,
+        departure=outgoing.start,
+    )
+
+
+def compute_relay_team(
+    conn: sqlite3.Connection, version: int, payload: RelayTeamCreate
+) -> RelayTeamOut:
+    """基于已发布版本快照核算接力队成绩（不读取实时成绩）。
+
+    - 版本不存在返回 404；选手人数不等于该版本站点数减一，或选手号重复，
+      返回 422；
+    - 每段仅由对应选手承担：第 i 名选手承担赛段 i→i+1，其棒次用时与两端
+      入选打卡均取自该版本快照中的对应分段；
+    - 选手不在版本内、负责分段为 pending，或交接站下一棒出发早于上一棒到达
+      （含某棒未到达 / 下一棒未出发）时，队伍待定：总用时为 null，并逐棒 /
+      逐交接给出原因；
+    - 全部有效时返回各棒用时、交接等待秒数与队伍总用时（首棒起点至末棒
+      终点），总用时严格等于各棒用时加全部交接等待。
+    """
+    pub = _load_publication(conn, version)
+    if pub is None:
+        raise HTTPException(status_code=404, detail=f"成绩版本 {version} 不存在")
+
+    expected = pub.station_count - 1
+    runner_ids = payload.runner_ids
+    if len(runner_ids) != expected:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"接力队人数 {len(runner_ids)} 不合法：版本 {version} 有 "
+                f"{pub.station_count} 个站点，需提交 {expected} 名选手"
+                "（站点数减一，每人承担一个赛段）"
+            ),
+        )
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for rid in runner_ids:
+        if rid in seen:
+            duplicates.add(rid)
+        seen.add(rid)
+    if duplicates:
+        raise HTTPException(
+            status_code=422,
+            detail="接力队选手不得重复，重复选手号："
+            + "、".join(sorted(duplicates)),
+        )
+
+    snapshot = {s.runner_id: s for s in pub.results}
+    legs = [
+        _relay_leg(leg=i, runner_id=rid, snapshot=snapshot)
+        for i, rid in enumerate(runner_ids, start=1)
+    ]
+    handoffs = [
+        _relay_handoff(station_seq=i + 1, incoming=legs[i - 1], outgoing=legs[i])
+        for i in range(1, len(legs))
+    ]
+
+    complete = all(leg.status == "ok" for leg in legs) and all(
+        h.status == "ok" for h in handoffs
+    )
+    total_seconds = None
+    if complete:
+        total_seconds = sum(
+            leg.duration_seconds for leg in legs
+        ) + sum(h.wait_seconds for h in handoffs)
+        # 首棒起点至末棒终点须与 各棒用时 + 全部等待 严格一致
+        assert total_seconds == int(
+            (legs[-1].finish.occurred_at - legs[0].start.occurred_at).total_seconds()
+        )
+    return RelayTeamOut(
+        version=version,
+        station_count=pub.station_count,
+        runner_ids=runner_ids,
+        complete=complete,
+        legs=legs,
+        handoffs=handoffs,
+        total_seconds=total_seconds,
+        total=_fmt_duration(total_seconds) if total_seconds is not None else None,
+    )

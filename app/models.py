@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -288,3 +288,90 @@ class PublicationOut(BaseModel):
         description="该版本全体有打卡记录选手的完整分段结果（按选手号排序）；"
         "未完赛选手同样保留 pending 分段",
     )
+
+
+RunnerId = Annotated[str, Field(..., min_length=1, max_length=64, description="选手号")]
+
+
+class RelayTeamCreate(BaseModel):
+    """接力队成绩核算请求：提交已发布版本号与按赛段顺序排列的选手号。
+
+    人数须等于该版本站点数减一（赛段数），且选手号不得重复；
+    每个赛段仅由对应选手承担，第 i 名选手承担赛段 i→i+1。
+    """
+
+    runner_ids: list[RunnerId] = Field(
+        ...,
+        description="按赛段顺序排列的选手号：第 i 人承担赛段 i→i+1；"
+        "人数须等于版本站点数减一，且不得重复",
+    )
+
+
+class RelayLegOut(BaseModel):
+    """接力队中的一棒：选手、承担赛段、两端入选打卡与该棒用时。"""
+
+    leg: int = Field(..., description="棒次（从 1 开始，即赛段序号）")
+    runner_id: str = Field(..., description="承担本棒的选手号")
+    from_station: int
+    to_station: int
+    status: Literal["ok", "pending"]
+    duration_seconds: Optional[int] = Field(
+        default=None, description="本棒用时（秒），取自版本快照中该选手的对应分段；仅 ok 时给出"
+    )
+    duration: Optional[str] = Field(default=None, description="本棒用时，H:MM:SS")
+    start: Optional[StationTime] = Field(
+        default=None, description="本棒起点入选打卡（版本快照），缺失时为 null"
+    )
+    finish: Optional[StationTime] = Field(
+        default=None, description="本棒终点入选打卡（版本快照），缺失时为 null"
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="待定原因：选手不在版本内 / 负责分段 pending / 交接站下一棒出发过早；ok 时为 null",
+    )
+
+
+class RelayHandoffOut(BaseModel):
+    """交接站：上一棒到达与下一棒出发及等待秒数（出发 - 到达）。"""
+
+    station_seq: int = Field(..., description="交接站序号（第 i 次交接在站点 i+1）")
+    incoming_leg: int = Field(..., description="上一棒棒次")
+    outgoing_leg: int = Field(..., description="下一棒棒次")
+    status: Literal["ok", "pending"]
+    wait_seconds: Optional[int] = Field(
+        default=None, description="交接等待秒数 = 下一棒出发时间 - 上一棒到达时间；仅 ok 时给出"
+    )
+    wait: Optional[str] = Field(default=None, description="交接等待时长，H:MM:SS")
+    arrival: Optional[StationTime] = Field(
+        default=None, description="上一棒到达本交接站的入选打卡（版本快照），缺失时为 null"
+    )
+    departure: Optional[StationTime] = Field(
+        default=None, description="下一棒从本交接站出发的入选打卡（版本快照），缺失时为 null"
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="待定原因：上一棒未到达 / 下一棒未出发 / 下一棒出发早于上一棒到达；ok 时为 null",
+    )
+
+
+class RelayTeamOut(BaseModel):
+    """接力队成绩核算结果（基于指定版本快照，不读取实时成绩）。"""
+
+    version: int = Field(..., description="核算所依据的已发布成绩版本号")
+    station_count: int = Field(..., description="版本快照中的赛道站点总数")
+    runner_ids: list[str] = Field(..., description="按赛段顺序排列的选手号（回显请求）")
+    complete: bool = Field(
+        ...,
+        description="所有棒次与交接均有效时为 true；任一棒次选手不在版本内、"
+        "负责分段 pending，或交接站下一棒出发早于上一棒到达时为 false",
+    )
+    legs: list[RelayLegOut] = Field(..., description="逐棒结果（按棒次升序）")
+    handoffs: list[RelayHandoffOut] = Field(
+        ..., description="逐交接站结果（按站点升序，共 棒数-1 个）"
+    )
+    total_seconds: Optional[int] = Field(
+        default=None,
+        description="队伍总用时（秒）= 各棒用时 + 全部交接等待（首棒起点至末棒终点）；"
+        "complete 为 false 时为 null",
+    )
+    total: Optional[str] = Field(default=None, description="队伍总用时，H:MM:SS")
