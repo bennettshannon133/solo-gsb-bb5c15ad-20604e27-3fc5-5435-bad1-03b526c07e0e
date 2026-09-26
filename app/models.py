@@ -277,6 +277,108 @@ class CalibratedOut(BaseModel):
     total: Optional[str] = Field(default=None, description="校准后总用时，H:MM:SS")
 
 
+class RelayTeamCreate(BaseModel):
+    """接力队成绩核算请求：指定已发布版本与按赛段顺序排列的选手号。
+
+    人数须等于该版本站点数减一、选手号不得重复；这些约束在服务层
+    （版本快照读出后）校验，非法时返回 422。
+    """
+
+    version: int = Field(..., description="已发布成绩版本号")
+    runner_ids: list[str] = Field(
+        ...,
+        description="按赛段顺序排列的选手号；第 i 人只承担第 i 段"
+        "（站点 i+1 → 站点 i+2），人数须等于版本站点数 - 1 且不得重复",
+    )
+
+
+class RelayLegOut(BaseModel):
+    """接力队中单棒的核算结果。"""
+
+    leg: int = Field(..., description="棒次，从 1 开始")
+    runner_id: Optional[str] = Field(
+        default=None, description="承担本棒的选手号；选手不在版本内时为 null"
+    )
+    from_station: int
+    to_station: int
+    start_event_no: Optional[str] = Field(
+        default=None, description="本棒起点入选打卡的事件号（取自版本快照）"
+    )
+    start_at: Optional[datetime] = Field(
+        default=None, description="本棒起点入选打卡时间"
+    )
+    finish_event_no: Optional[str] = Field(
+        default=None, description="本棒终点入选打卡的事件号"
+    )
+    finish_at: Optional[datetime] = Field(
+        default=None, description="本棒终点入选打卡时间"
+    )
+    duration_seconds: Optional[int] = Field(
+        default=None, description="本棒用时（秒）；本棒待定时为 null"
+    )
+    duration: Optional[str] = Field(
+        default=None, description="本棒用时，H:MM:SS；本棒待定时为 null"
+    )
+    reason: Optional[str] = Field(
+        default=None, description="本棒待定原因（选手不在版本 / 分段 pending / 交接出发过早）"
+    )
+
+
+class RelayHandoverOut(BaseModel):
+    """交接站（两棒之间）的核算结果。"""
+
+    station_seq: int = Field(..., description="交接站序号")
+    incoming_runner_id: Optional[str] = Field(
+        default=None, description="到达本交接站的上一棒选手号"
+    )
+    outgoing_runner_id: Optional[str] = Field(
+        default=None, description="从本交接站出发的下一棒选手号"
+    )
+    arrived_at: Optional[datetime] = Field(
+        default=None, description="上一棒到达本交接站的时间"
+    )
+    departed_at: Optional[datetime] = Field(
+        default=None, description="下一棒从本交接站出发的时间"
+    )
+    wait_seconds: Optional[int] = Field(
+        default=None,
+        description="交接等待秒数 = 下一棒出发 - 上一棒到达；无法核算或出发过早时为 null",
+    )
+    wait: Optional[str] = Field(
+        default=None, description="交接等待，H:MM:SS；无法核算或出发过早时为 null"
+    )
+    reason: Optional[str] = Field(
+        default=None, description="无法核算或出发过早的原因；正常交接时为 null"
+    )
+
+
+class RelayTeamOut(BaseModel):
+    """接力队成绩核算结果：全部数据来自同一个已发布版本快照。"""
+
+    version: int = Field(..., description="核算所依据的已发布版本号")
+    station_count: int = Field(..., description="该版本的赛道站点总数")
+    runner_ids: list[str] = Field(
+        ..., description="按赛段顺序提交的选手号"
+    )
+    complete: bool = Field(
+        ...,
+        description="所有棒次均可核算（选手在版本内、对应分段非 pending、"
+        "交接站下一棒出发不早于上一棒到达）时为 true",
+    )
+    total_seconds: Optional[int] = Field(
+        default=None,
+        description="队伍总用时（秒）= 首棒起点至末棒终点 = 各棒用时 + 全部等待；"
+        "队伍待定时为 null",
+    )
+    total: Optional[str] = Field(
+        default=None, description="队伍总用时，H:MM:SS；队伍待定时为 null"
+    )
+    legs: list[RelayLegOut] = Field(..., description="逐棒结果，按棒次升序")
+    handovers: list[RelayHandoverOut] = Field(
+        ..., description="逐交接站结果，按站点升序（站点 2 … N-1）"
+    )
+
+
 class PublicationOut(BaseModel):
     """一个已发布版本的完整成绩快照。"""
 

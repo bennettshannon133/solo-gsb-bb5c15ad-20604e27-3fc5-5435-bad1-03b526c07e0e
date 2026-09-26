@@ -28,6 +28,10 @@ from .models import (
     NeutralizedSegment,
     PreviewCorrectionOut,
     PublicationOut,
+    RelayHandoverOut,
+    RelayLegOut,
+    RelayTeamCreate,
+    RelayTeamOut,
     RunnerPreview,
     RunnerSummary,
     Segment,
@@ -835,3 +839,202 @@ def get_latest_publication(conn: sqlite3.Connection) -> PublicationOut:
     if header is None or header["version"] is None:
         raise HTTPException(status_code=404, detail="尚未发布任何成绩版本")
     return get_publication(conn, header["version"])
+
+
+# ---------- 接力队成绩核算 ----------
+
+
+def compute_relay_team(conn: sqlite3.Connection, payload: RelayTeamCreate) -> RelayTeamOut:
+    """基于已发布版本快照核算接力队成绩（只读，不触碰实时成绩）。
+
+    - 提交已发布版本号与按赛段顺序排列的选手号：第 i 人只承担第 i 段
+      （站点 i+1 → 站点 i+2），人数须等于该版本站点数 - 1 且不得重复，
+      否则 422；版本不存在 404；
+    - 各选手的分段与两端入选打卡全部取自同一次加载的版本快照
+      （publication_entries），不读取 checkins 实时表，因此发布后的
+      打卡 / 更正 / 撤销不影响核算；
+    - 任一棒满足以下情形之一时，该棒待定：选手不在版本内（该版本无
+      任何打卡记录）；其负责的分段在快照中为 pending（缺站或时间倒退，
+      沿用快照中的原因）；交接站下一棒出发早于上一棒到达（时间倒流，
+      对应交接站同样记为无法核算）；
+    - 所有棒次均可核算时，给出每棒用时、各交接站等待秒数（出发 - 到达，
+      可为 0）与队伍总用时（首棒起点至末棒终点），且总用时严格等于
+      各棒用时加全部等待；队伍待定时总用时为 null。
+    """
+    pub = _load_publication(conn, payload.version)
+    if pub is None:
+        raise HTTPException(
+            status_code=404, detail=f"成绩版本 {payload.version} 不存在"
+        )
+
+    runner_ids = payload.runner_ids
+    expected = pub.station_count - 1
+    if len(runner_ids) != expected:
+        raise HTTPException(
+            status_code=422,
+            detail=f"接力队人数 {len(runner_ids)} 不合法："
+            f"版本 {payload.version} 站点数为 {pub.station_count}，"
+            f"须恰好提交 {expected} 名选手（站点数 - 1）",
+        )
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for rid in runner_ids:
+        if rid in seen and rid not in duplicates:
+            duplicates.append(rid)
+        seen.add(rid)
+    if duplicates:
+        raise HTTPException(
+            status_code=422,
+            detail=f"接力队选手号不得重复，重复选手：{', '.join(duplicates)}",
+        )
+
+    by_runner = {r.runner_id: r for r in pub.results}
+
+    # 先逐棒收集快照中的分段与两端入选打卡，并记录选手缺失 / 分段 pending
+    legs: list[dict] = []
+    for i, runner_id in enumerate(runner_ids):
+        leg_no = i + 1
+        from_station, to_station = leg_no, leg_no + 1
+        entry: dict = {
+            "leg": leg_no,
+            "runner_id": runner_id,
+            "from_station": from_station,
+            "to_station": to_station,
+            "start_event_no": None,
+            "start_at": None,
+            "finish_event_no": None,
+            "finish_at": None,
+            "duration_seconds": None,
+            "reasons": [],
+        }
+        splits = by_runner.get(runner_id)
+        if splits is None:
+            entry["reasons"].append(f"选手 {runner_id} 不在版本 {payload.version} 内")
+        else:
+            seg = splits.segments[i]  # 快照逐选手覆盖全部分段，序号与棒次一一对应
+            start = next(
+                (s for s in splits.stations if s.station_seq == from_station), None
+            )
+            finish = next(
+                (s for s in splits.stations if s.station_seq == to_station), None
+            )
+            if start is not None:
+                entry["start_event_no"] = start.event_no
+                entry["start_at"] = start.occurred_at
+            if finish is not None:
+                entry["finish_event_no"] = finish.event_no
+                entry["finish_at"] = finish.occurred_at
+            if seg.status == "pending":
+                entry["duration_seconds"] = None
+                entry["reasons"].append(
+                    f"选手 {runner_id} 负责的分段 {from_station}→{to_station} "
+                    f"在版本中为待定：{seg.reason}"
+                )
+            else:
+                entry["duration_seconds"] = seg.duration_seconds
+        legs.append(entry)
+
+    # 逐交接站核算等待；下一棒出发早于上一棒到达时双方都标记待定
+    handovers: list[dict] = []
+    for leg_no in range(1, len(legs)):
+        incoming, outgoing = legs[leg_no - 1], legs[leg_no]
+        station_seq = leg_no + 1
+        arrived_at = incoming["finish_at"]
+        departed_at = outgoing["start_at"]
+        handover: dict = {
+            "station_seq": station_seq,
+            "incoming_runner_id": incoming["runner_id"],
+            "outgoing_runner_id": outgoing["runner_id"],
+            "arrived_at": arrived_at,
+            "departed_at": departed_at,
+            "wait_seconds": None,
+            "reason": None,
+        }
+        if arrived_at is None or departed_at is None:
+            missing = []
+            if arrived_at is None:
+                missing.append("上一棒到达")
+            if departed_at is None:
+                missing.append("下一棒出发")
+            handover["reason"] = (
+                f"交接站 {station_seq} 缺少{'、'.join(missing)}打卡，无法核算等待"
+            )
+        elif departed_at < arrived_at:
+            reason = (
+                f"交接站 {station_seq} 下一棒（选手 {outgoing['runner_id']}）"
+                f"出发时间 {departed_at.isoformat()} 早于上一棒"
+                f"（选手 {incoming['runner_id']}）到达时间 {arrived_at.isoformat()}"
+            )
+            handover["reason"] = reason
+            # 时间倒流：下一棒整体不能成立
+            outgoing["reasons"].append(reason)
+            outgoing["duration_seconds"] = None
+        else:
+            handover["wait_seconds"] = int(
+                (departed_at - arrived_at).total_seconds()
+            )
+        handovers.append(handover)
+
+    leg_outs: list[RelayLegOut] = []
+    for entry in legs:
+        duration_seconds = entry["duration_seconds"]
+        leg_outs.append(
+            RelayLegOut(
+                leg=entry["leg"],
+                runner_id=entry["runner_id"],
+                from_station=entry["from_station"],
+                to_station=entry["to_station"],
+                start_event_no=entry["start_event_no"],
+                start_at=entry["start_at"],
+                finish_event_no=entry["finish_event_no"],
+                finish_at=entry["finish_at"],
+                duration_seconds=duration_seconds,
+                duration=_fmt_duration(duration_seconds)
+                if duration_seconds is not None
+                else None,
+                reason="；".join(entry["reasons"]) if entry["reasons"] else None,
+            )
+        )
+
+    handover_outs = [
+        RelayHandoverOut(
+            station_seq=h["station_seq"],
+            incoming_runner_id=h["incoming_runner_id"],
+            outgoing_runner_id=h["outgoing_runner_id"],
+            arrived_at=h["arrived_at"],
+            departed_at=h["departed_at"],
+            wait_seconds=h["wait_seconds"],
+            wait=_fmt_duration(h["wait_seconds"])
+            if h["wait_seconds"] is not None
+            else None,
+            reason=h["reason"],
+        )
+        for h in handovers
+    ]
+
+    complete = all(h.reason is None for h in handover_outs) and all(
+        l.reason is None for l in leg_outs
+    )
+    total_seconds: int | None = None
+    if complete:
+        total_seconds = sum(
+            l.duration_seconds for l in leg_outs
+        ) + sum(h.wait_seconds for h in handover_outs)
+        # 首棒起点至末棒终点必须与"各棒用时 + 全部等待"恒等
+        if legs:
+            span = int(
+                (legs[-1]["finish_at"] - legs[0]["start_at"]).total_seconds()
+            )
+            assert span == total_seconds, (span, total_seconds)
+        else:
+            total_seconds = 0  # 版本仅有 1 个站点（无赛段）的退化情形
+    return RelayTeamOut(
+        version=payload.version,
+        station_count=pub.station_count,
+        runner_ids=runner_ids,
+        complete=complete,
+        total_seconds=total_seconds,
+        total=_fmt_duration(total_seconds) if total_seconds is not None else None,
+        legs=leg_outs,
+        handovers=handover_outs,
+    )

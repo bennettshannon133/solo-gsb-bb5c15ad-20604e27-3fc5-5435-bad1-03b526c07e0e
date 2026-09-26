@@ -22,6 +22,11 @@
 - 支持**成绩发布**：在同一 SQLite 事务内读取当前打卡、按现有分段规则为所有有记录选手
   （含未完赛、保留 `pending` 分段者）生成**单调递增、不可变的版本快照**并整版原子保存；
 - 已发布版本按版本号 / 最新版查询；后续打卡、更正或撤销只影响实时成绩，**不改已发布版本**；
+- 支持**接力队成绩核算**：提交已发布版本号与按赛段顺序排列的选手号（每段仅由对应选手承担，
+  人数 = 版本站点数 - 1 且不得重复），从**同一版本快照**读取各人的对应分段与两端入选打卡
+  （**不读实时成绩**），逐棒返回用时与交接等待；选手不在版本内、负责分段 `pending` 或交接站
+  下一棒出发早于上一棒到达时队伍待定（空总用时、逐棒原因），否则给出队伍总用时
+  （首棒起点至末棒终点 = 各棒用时 + 全部等待）；
 - 提供选手分段结果查询。
 
 ## 启动
@@ -63,6 +68,7 @@ Compose 通过命名卷 `timing-data` 持久化数据；删除卷（`docker comp
 | `POST` | `/api/publications` | 发布成绩版本：同一事务读取当前打卡、整版快照原子保存，返回新版本完整成绩 |
 | `GET` | `/api/publications/{version}` | 按版本号查询该版本完整成绩（不存在返回 404） |
 | `GET` | `/api/publications/latest` | 查询最新发布版本完整成绩（尚未发布时返回 404） |
+| `POST` | `/api/relay-teams` | 接力队成绩核算：基于已发布版本快照，按赛段顺序的选手号逐棒核算用时与交接等待（只读快照） |
 
 ### 示例
 
@@ -411,6 +417,103 @@ curl http://localhost:8000/api/publications/1         # 仍是发布时的 v1 �
 curl http://localhost:8000/api/publications/latest    # -> version 2
 ```
 
+## 接力队成绩核算
+
+接力队由若干选手按赛段顺序组成：提交**已发布成绩版本号**与按赛段顺序排列的**选手号数组**，
+第 `i` 名选手只承担第 `i` 个赛段（站点 `i+1 → i+2`）。核算**只读指定版本的快照**
+（`publication_entries`），完全不读取 `checkins` 实时表，因此发布后的打卡 / 更正 / 撤销
+不影响结果。
+
+- 人数必须恰好等于**该版本站点数 - 1**（分段数），选手号不得重复，否则返回 `422`；
+  版本不存在返回 `404`（版本校验先于人数 / 重复校验）；
+- 每棒从该选手在版本快照中的**对应分段**与**两端入选打卡**（站点、事件号、时间）取值；
+- 交接站（站点 2 … N-1）的**等待秒数** = 下一棒出发时间 − 上一棒到达时间，同时到达 / 出发
+  时等待为 `0`（合法）；
+- 出现以下任一情形时对应棒次待定，整队 `complete=false`、`total_seconds/total` 为 `null`，
+  并在 `legs[].reason` / `handovers[].reason` 给出逐棒原因：
+  - 选手不在版本内（该版本快照中无此选手的任何记录）；
+  - 该选手负责的分段在版本中为 `pending`（缺站或时间倒退，原因沿用快照）；
+  - 交接站下一棒出发**早于**上一棒到达（时间倒流，下一棒标记待定，该交接等待无法核算）；
+- 全部棒次可核算时，队伍总用时为**首棒起点至末棒终点**，并严格等于
+  **各棒用时之和 + 全部交接等待之和**。
+
+请求示例（先为五名接力选手登记各自负责赛段两端的打卡并发布）：
+
+```bash
+curl -X POST http://localhost:8000/api/checkins -H 'Content-Type: application/json' \
+  -d '{"event_no":"T1-S1","runner_id":"T1","station_seq":1,"occurred_at":"2026-09-25T08:00:00"}'
+curl -X POST http://localhost:8000/api/checkins -H 'Content-Type: application/json' \
+  -d '{"event_no":"T1-S2","runner_id":"T1","station_seq":2,"occurred_at":"2026-09-25T08:30:00"}'
+curl -X POST http://localhost:8000/api/checkins -H 'Content-Type: application/json' \
+  -d '{"event_no":"T2-S2","runner_id":"T2","station_seq":2,"occurred_at":"2026-09-25T08:35:00"}'
+curl -X POST http://localhost:8000/api/checkins -H 'Content-Type: application/json' \
+  -d '{"event_no":"T2-S3","runner_id":"T2","station_seq":3,"occurred_at":"2026-09-25T09:20:00"}'
+# … T3 承担 3→4（09:25→10:10）、T4 承担 4→5（10:10→11:00）、T5 承担 5→6（11:05→12:10）
+curl -X POST http://localhost:8000/api/publications
+```
+
+```bash
+curl -X POST http://localhost:8000/api/relay-teams \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "runner_ids": ["T1", "T2", "T3", "T4", "T5"]}'
+```
+
+响应（棒次用时 30/45/45/50/65 分钟，交接等待 5/5/0/5 分钟，总用时 4:10:00）：
+
+```json
+{
+  "version": 1,
+  "station_count": 6,
+  "runner_ids": ["T1", "T2", "T3", "T4", "T5"],
+  "complete": true,
+  "total_seconds": 15000,
+  "total": "4:10:00",
+  "legs": [
+    {"leg": 1, "runner_id": "T1", "from_station": 1, "to_station": 2,
+     "start_event_no": "T1-S1", "start_at": "2026-09-25T08:00:00Z",
+     "finish_event_no": "T1-S2", "finish_at": "2026-09-25T08:30:00Z",
+     "duration_seconds": 1800, "duration": "0:30:00", "reason": null},
+    {"leg": 2, "runner_id": "T2", "from_station": 2, "to_station": 3,
+     "start_event_no": "T2-S2", "start_at": "2026-09-25T08:35:00Z",
+     "finish_event_no": "T2-S3", "finish_at": "2026-09-25T09:20:00Z",
+     "duration_seconds": 2700, "duration": "0:45:00", "reason": null}
+  ],
+  "handovers": [
+    {"station_seq": 2, "incoming_runner_id": "T1", "outgoing_runner_id": "T2",
+     "arrived_at": "2026-09-25T08:30:00Z", "departed_at": "2026-09-25T08:35:00Z",
+     "wait_seconds": 300, "wait": "0:05:00", "reason": null},
+    {"station_seq": 3, "incoming_runner_id": "T2", "outgoing_runner_id": "T3",
+     "arrived_at": "2026-09-25T09:20:00Z", "departed_at": "2026-09-25T09:25:00Z",
+     "wait_seconds": 300, "wait": "0:05:00", "reason": null}
+  ]
+}
+```
+
+待定时（下例中 `R003` 在种子版本 v1 内缺第 4 站、其负责的 3→4 分段为 `pending`）
+`complete=false`、总用时为 `null`，相应棒次的 `duration_seconds/duration` 为 `null`
+并给出原因；仍可核算的其他棒次与交接站照常返回：
+
+```bash
+curl -X POST http://localhost:8000/api/relay-teams \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "runner_ids": ["R001", "R002", "R003", "R004", "R006"]}'
+```
+
+```json
+{
+  "complete": false,
+  "total_seconds": null,
+  "total": null,
+  "legs": [
+    {"leg": 3, "runner_id": "R003", "from_station": 3, "to_station": 4,
+     "start_event_no": "S-R003-3", "start_at": "2026-09-25T09:35:00Z",
+     "finish_event_no": null, "finish_at": null,
+     "duration_seconds": null, "duration": null,
+     "reason": "选手 R003 负责的分段 3→4 在版本中为待定：站点 4 缺少有效打卡"}
+  ]
+}
+```
+
 ## 本地开发
 
 ```bash
@@ -444,4 +547,10 @@ pytest                               # 运行测试
   `INTEGER PRIMARY KEY AUTOINCREMENT` 保证版本号单调递增、不重用）与全体选手快照
   （`publication_entries`，逐选手 `SplitsOut` JSON）在同一事务内原子提交；持锁期间并发打卡 /
   更正 / 撤销一律阻塞（配合 `busy_timeout`），同一版本不会混入不同时间点的数据；
-- 已发布版本是独立于 `checkins` 实时表的快照，后续打卡 / 更正 / 撤销不会改写历史版本。
+- 已发布版本是独立于 `checkins` 实时表的快照，后续打卡 / 更正 / 撤销不会改写历史版本；
+- 接力队核算先按版本号加载整版快照（不存在 `404`），再校验人数 = 快照 `station_count - 1`
+  与选手号不重复（`422`）；各棒的分段状态、用时与两端入选打卡全部取自该选手在快照中的
+  `SplitsOut`（棒次与分段序号一一对应），全程不读 `checkins` 实时表，因此结果只随版本变化；
+  交接等待 = 下一棒起点入选时间 − 上一棒终点入选时间，出发早于到达时双方标记待定、不给用时
+  与等待；总用时由"各棒用时 + 全部等待"求和（与首棒起点至末棒终点的时间跨度恒等，代码内置
+  断言保证），任一一棒待定时总用时为 `null`。
